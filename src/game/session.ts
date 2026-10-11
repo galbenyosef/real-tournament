@@ -23,6 +23,10 @@ const TARGET_TILES_H = 14;
 const CAMERA_STEP_X = 6;
 const CAMERA_STEP_Y = 9;
 const TOAST_TICKS = 36;
+/** a prediction correction bigger than this is a teleport or a respawn: shown at once, not smoothed */
+const MAX_SMOOTH_PX = 64;
+/** how much of a smoothed correction is left after each drawn frame (about 100 ms to fade out at 60 fps) */
+const SMOOTH_DECAY = 0.86;
 
 export interface SessionDeps {
   sprites: Sprites;
@@ -59,6 +63,8 @@ export class GameSession {
   private pulseSel: InputState['weaponSelect'] = -1;
   private pulseDelta: InputState['weaponDelta'] = 0;
   private dirty = false;
+  /** per fighter: screen offset still to fade out after a prediction correction (smoothing), in pixels */
+  private readonly corr: { x: number; y: number }[] = [0, 1, 2, 3].map(() => ({ x: 0, y: 0 }));
   result: MatchResult = { over: false, winner: null };
   private readonly effects = new Effects();
   private readonly anim = newWorldAnim();
@@ -166,6 +172,7 @@ export class GameSession {
   /** A confirmed tick arrived: restart from the confirmed state and replay the local input that is still unconfirmed. */
   private rebuildPrediction(): void {
     const to = this.shown.tick;
+    const seen = this.shown.fighters.map((f) => ({ x: f.x, y: f.y }));
     this.shown = cloneMatch(this.auth);
     this.dirty = false;
     if (to <= this.shown.tick) { this.snapPrev(this.shown); return; }
@@ -174,6 +181,43 @@ export class GameSession {
       step(this.shown, this.predictedInputs(this.history.get(t) ?? { ...this.held, weaponSelect: -1, weaponDelta: 0 }));
       this.shown.events.length = 0;
     }
+    this.smoothCorrections(seen);
+  }
+
+  /**
+   * The corrected simulation may put a fighter somewhere else than where the player has just seen him. Instead of a
+   * jump, keep the difference as an offset that fades out over a few frames: what is drawn stays continuous.
+   * Big differences (teleports, respawns) are not smoothed.
+   */
+  private smoothCorrections(seen: { x: number; y: number }[]): void {
+    this.shown.fighters.forEach((f, i) => {
+      const was = seen[i];
+      const c = this.corr[i];
+      if (!was || !c) return;
+      const dx = was.x - f.x;
+      const dy = was.y - f.y;
+      if (Math.abs(dx) > MAX_SMOOTH_PX || Math.abs(dy) > MAX_SMOOTH_PX) {
+        c.x = 0;
+        c.y = 0;
+        return;
+      }
+      c.x = Math.max(-MAX_SMOOTH_PX, Math.min(MAX_SMOOTH_PX, c.x + dx));
+      c.y = Math.max(-MAX_SMOOTH_PX, Math.min(MAX_SMOOTH_PX, c.y + dy));
+    });
+  }
+
+  /** Fades the correction offsets (called once per drawn frame). */
+  private decayCorrections(): void {
+    for (const c of this.corr) {
+      c.x = Math.abs(c.x) < 0.5 ? 0 : c.x * SMOOTH_DECAY;
+      c.y = Math.abs(c.y) < 0.5 ? 0 : c.y * SMOOTH_DECAY;
+    }
+  }
+
+  /** The offset (px) currently applied to a fighter's drawn position after a prediction correction. */
+  correctionOf(slot: number): { x: number; y: number } {
+    const c = this.corr[slot];
+    return { x: Math.round(c?.x ?? 0), y: Math.round(c?.y ?? 0) };
   }
 
   private advance(inputs: Map<number, InputState>): void {
@@ -274,6 +318,8 @@ export class GameSession {
       fi.x = Math.round(p.x + (fi.x - p.x) * alpha);
       fi.y = Math.round(p.y + (fi.y - p.y) * alpha);
     });
+    // a prediction correction fades out instead of jumping (restored with the other interpolated values below)
+    m.fighters.forEach((fi, i) => { const c = this.corr[i]; if (c) { fi.x += Math.round(c.x); fi.y += Math.round(c.y); } });
     const savedProj = m.projectiles.map((p) => p.x);
     m.projectiles.forEach((p) => {
       const px = this.prevProj.get(p);
@@ -295,5 +341,6 @@ export class GameSession {
     drawHud(ctx, m, this.localSlot, { w: f.w, h: f.h, dpr: f.dpr }, f.safe);
     if (this.toast) drawToast(ctx, this.toast.text, { w: f.w, h: f.h, dpr: f.dpr }, f.safe, f.safe.t + 74);
     if (f.showControls) drawControls(ctx, f.layout, f.held, f.stick, f.dpr, this.allyOrder, m.fighters[this.localSlot]!.currentWeapon);
+    this.decayCorrections();
   }
 }

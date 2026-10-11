@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { loadCharsFromDisk } from '../../src/assets/disk';
 import type { Sprites } from '../../src/assets/sprites';
 import type { Audio } from '../../src/audio/audio';
 import { botHooks } from '../../src/bots';
@@ -12,7 +13,8 @@ import type { Platform } from '../../src/platform/telegram';
 import { REAL_ASSETS, REAL_MAPS } from '../engine/real';
 
 const audio = { init() {}, unlock: async () => {}, running: true, nowPlaying: null, play: () => {}, playMusic: () => {}, setEnabled: () => {}, suspend: () => {}, resume: () => {}, poke: () => {}, debug: () => '' } as Audio;
-const deps: SessionDeps = { sprites: {} as Sprites, audio, platform: { haptic: () => {} } as unknown as Platform, assets: REAL_ASSETS, maps: REAL_MAPS };
+const img = {} as ImageBitmap;
+const deps: SessionDeps = { sprites: { tiles: img, energy: img, sheets: [img, img, img, img], chars: loadCharsFromDisk('public/original') } as unknown as Sprites, audio, platform: { haptic: () => {} } as unknown as Platform, assets: REAL_ASSETS, maps: REAL_MAPS };
 const OPTS: MatchOptions = { mapId: 3, mode: 'dm', skill: 2, bots: 3, fragLimit: 0, noMedikits: false, violence: true, team: false, playerColor: 0, humans: 2 };
 const NAMES = ['Me', 'Friend', '', ''];
 
@@ -98,6 +100,53 @@ describe('client-side prediction', () => {
     s.setLocalInput(NO_INPUT);
     s.predictTo(2);
     expect(s.match.tick).toBe(2);
+  });
+});
+
+describe('smoothing of prediction corrections', () => {
+  /** a drawing context that accepts every call (the session draws through it) */
+  const ctx = new Proxy({ canvas: { width: 0, height: 0 } }, {
+    get: (t, name: string) => (name in t ? (t as Record<string, unknown>)[name] : (): unknown => (name === 'measureText' ? { width: 10 } : undefined)),
+    set: () => true,
+  }) as unknown as CanvasRenderingContext2D;
+  const frame = { w: 956, h: 440, dpr: 1, safe: { l: 0, r: 0, t: 0, b: 0 }, layout: { buttons: [], stick: { cx: 0, cy: 0, r: 0 } } as never, held: new Set<never>(), stick: { active: false, x: 0, y: 0 }, showControls: false };
+
+  /** the friend changes direction while my prediction assumed he keeps going: corrections are certain */
+  function play(): { s: GameSession; maxOffset: number } {
+    const s = new GameSession(OPTS, 4242, deps, 0, NAMES);
+    const ls = new Lockstep([0, 1]);
+    let maxOffset = 0;
+    for (let n = 1; n <= 80; n++) {
+      s.setLocalInput(input(0));
+      s.predictTo(n + 4);
+      if (n > 4) { const k = n - 4; ls.push(k, [wire(0), wire((k >> 3) % 2 === 0 ? 0x20 : 4)]); s.tickNet(ls.pull()!); }
+      s.predictTo(n + 4); // rebuilds from the confirmed tick
+      for (let f = 0; f < 4; f++) {
+        const c = s.correctionOf(1);
+        maxOffset = Math.max(maxOffset, Math.abs(c.x), Math.abs(c.y));
+        s.draw(ctx, frame as never, 1);
+      }
+    }
+    return { s, maxOffset };
+  }
+
+  it('turns a correction into an offset that fades out over a few frames instead of a jump', () => {
+    const { s, maxOffset } = play();
+    expect(maxOffset).toBeGreaterThan(0); // the correction really happened and was kept as an offset
+    expect(maxOffset).toBeLessThanOrEqual(64);
+    for (let i = 0; i < 80; i++) s.draw(ctx, frame as never, 1);
+    expect(s.correctionOf(1)).toEqual({ x: 0, y: 0 }); // fully faded
+  });
+
+  it('never smooths a teleport or a respawn (a difference above the limit is shown at once)', () => {
+    const s = new GameSession(OPTS, 4242, deps, 0, NAMES);
+    s.predictTo(3);
+    // pretend the server put fighter 1 far away from where the prediction had him
+    const wasX = s.match.fighters[1]!.x;
+    s.authoritative.fighters[1]!.x = wasX + 400;
+    s.tickNet({ n: 1, inputs: new Map([[0, input(0)], [1, input(0)]]), dropped: [] });
+    s.predictTo(3);
+    expect(s.correctionOf(1)).toEqual({ x: 0, y: 0 });
   });
 });
 
